@@ -48,12 +48,15 @@ fuzz = ["account-swap", "close_position", "account 1 swapped"]   # or tests_fail
 ```
 
 Turn a check off with the smallest edit: `if false && <cond> {`, or delete a `verify_*(...)?;`
-line. Each row says what notices, in one of four ways:
+line. `in_fn` must occur once in the file and `find` once inside that function (to its matching
+closing brace); if not, the CLI stops rather than guess, so add context to make them unique. Each row says what notices, in one of four ways:
 
 - `fuzz = [...]`: a fuzzer finding containing every piece of text.
 - `tests_fail = [...]`: exactly these tests fail, every other passes.
-- `refused = { probe = "...", log = "..." }`: nothing above notices, because something else
-  refuses the call (the runtime, another check, the token program); `log` names it.
+- `refused = { probe = "<spec> | <variant>", log = "..." }`: nothing above notices, because
+  something else refuses the call (the runtime, another check, the token program). The probe
+  command prints one line per call, `PROBE <spec> | <variant> | ok=<bool> | <log>...`; the line
+  is picked by spec and variant exactly, must say `ok=false`, and `log` names what refused it.
 - none of these: **unproven**. Nothing in the repository notices the check is gone.
 
 ## 3. Predict, then measure

@@ -32,8 +32,20 @@ the file says, and 2 if something could not run.
 
 The file holds the commands (`build`, `test`, optionally `fuzz`, `probe` and `prepare`) and one
 `[[claim]]` per check. [`examples/unproven.toml`](examples/unproven.toml) is a real one, with 17
-rows. Today the test output is read in `cargo test`'s format, and fuzz findings in
-[Crucible](https://github.com/asymmetric-research/crucible)'s.
+rows. What it reads, today:
+
+- tests: `cargo test`'s output (`test <path> ... FAILED`). A test command that fails with no
+  failing test is a build error, and stops the run.
+- fuzz: [Crucible](https://github.com/asymmetric-research/crucible)'s (`[FUZZ_FINDING] [...]`). A
+  fuzzer that exits early or never prints `fuzz_alive` (default `[FUZZ_PULSE]`) stops the run,
+  so a fuzzer that did not run is never read as "no finding".
+- probe: your own command, one line per call: `PROBE <spec> | <variant> | ok=<bool> | <log>...`.
+
+A check is deleted by replacing `find` inside the function that starts at `in_fn`, to its
+matching closing brace. Both must occur exactly once. The original is written next to the file
+first and put back after each row, on an error, on Ctrl-C and on SIGTERM. After a signal, and
+after a run killed outright, `<file>.unproven-orig` stays next to it; the next run puts it back
+(after a signal it is the same as the file, and can also simply be deleted).
 
 ## With an AI agent
 

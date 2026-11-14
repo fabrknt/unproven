@@ -1,0 +1,12 @@
+[package]
+name = "unproven"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "For each check in code an AI wrote: delete it, and see whether anything notices"
+license = "Apache-2.0"
+repository = "https://github.com/fabrknt/unproven"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

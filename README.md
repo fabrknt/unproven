@@ -68,6 +68,10 @@ Until the finding a row expects has been seen, the fuzzer's output is read to th
 pipe; when it cannot be (a process the fuzzer started keeps it open) or a read fails, the run
 stops with an error rather than read what it has as complete.
 
+**It runs your commands.** `build`, `test`, `fuzz`, `probe` and `prepare` are run as written,
+with your permissions, many times over. Run unproven only on a repository you trust, or in a
+throwaway machine or container, and never where keys or credentials live.
+
 ## With an AI agent
 
 The agent does the reading: it chooses the checks, writes the rows, predicts, and explains what came back.

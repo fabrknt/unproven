@@ -166,6 +166,18 @@ fn main() {
 
     take_lock(&root);
 
+    // A file is replaced by renaming over it, which would turn a symlink
+    // into a copy and leave its target changed.
+    for c in &claims.claim {
+        let path = root.join(&c.file);
+        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+            die(&format!(
+                "{}: is a symlink; name the file it points to",
+                c.file
+            ));
+        }
+    }
+
     // A run killed half-way leaves a backup; put the original back first.
     for c in &claims.claim {
         restore_backup(&root.join(&c.file));
@@ -691,7 +703,14 @@ fn fuzz(
         }
     };
     loop {
-        if child.try_wait().ok().flatten().is_some() {
+        let gone = match child.try_wait() {
+            Ok(status) => status.is_some(),
+            Err(e) => {
+                stop_fuzzer();
+                return Err(format!("waiting for `{cmd}`: {e}"));
+            }
+        };
+        if gone {
             // Read what it printed before it went: until the pipe closes,
             // or, if something it started still holds it, a quiet second.
             while let Ok(line) = rx.recv_timeout(Duration::from_secs(1)) {
@@ -746,8 +765,9 @@ fn fuzz(
             }
         }
     }
-    let status = child.wait().ok();
+    let status = child.wait();
     FUZZ_PGID.store(0, Ordering::SeqCst);
+    let status = status.map_err(|e| format!("waiting for `{cmd}`: {e}"))?;
     // A finding the row expects shows the fuzzer ran. Anything else must
     // have run to the clock, saying all along that it was alive.
     if !hit {
@@ -852,7 +872,10 @@ fn restore_backup(file: &Path) {
     let _ = std::fs::remove_file(restoring_of(file));
     let backup = backup_of(file);
     if backup.exists() {
-        if let Err(e) = std::fs::rename(&backup, file).and_then(|_| sync_dir(file)) {
+        // Copied, not renamed: the backup is let go only once the file is
+        // back and synced.
+        let restored = std::fs::read(&backup).and_then(|original| durable_replace(file, &original));
+        if let Err(e) = restored.and_then(|_| std::fs::remove_file(&backup)) {
             eprintln!(
                 "unproven: could not put {} back from {}: {e}",
                 file.display(),
@@ -881,7 +904,8 @@ fn apply(file: &Path, original: &str, mutated: &str) {
             Err(format!("{}: {e}", backup.display()))
         } else {
             *editing = Some(file.to_path_buf());
-            std::fs::write(file, mutated).map_err(|e| format!("{}: {e}", file.display()))
+            durable_replace(file, mutated.as_bytes())
+                .map_err(|e| format!("{}: {e}", file.display()))
         }
     };
     if let Err(e) = result {

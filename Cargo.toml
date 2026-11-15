@@ -1,6 +1,6 @@
 [package]
 name = "unproven"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.82"
 description = "Find the checks in AI-written code that nothing proves: delete each one, and see whether anything notices"

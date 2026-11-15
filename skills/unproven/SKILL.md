@@ -54,6 +54,8 @@ line. `in_fn` must occur once in the file and `find` once inside that function (
 closing brace); if not, the CLI stops rather than guess, so add context to make them unique. Each row says what notices, in one of four ways:
 
 - `fuzz = [...]`: a fuzzer finding containing every piece of text.
+- Set `test_format = "forge"` for Foundry (tests are then named `<Contract>::<test>`); the
+  default is `cargo`.
 - `tests_fail = [...]`: exactly these tests fail, every other passes. Name each by its full
   path (`tests::x`) or by its bare name if no other failing test ends the same way.
 - `refused = { probe = "<spec> | <variant>", log = "..." }`: nothing above notices, because

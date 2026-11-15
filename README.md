@@ -35,8 +35,10 @@ The file holds the commands (`build`, `test`, optionally `fuzz`, `probe` and `pr
 `[[claim]]` per check. [`examples/unproven.toml`](examples/unproven.toml) is a real one, with 17
 rows. What it reads, today:
 
-- tests: `cargo test`'s output (`test <path> ... FAILED`). A test command that fails with no
-  failing test is a build error, and stops the run.
+- tests, by `test_format`: `cargo` (the default, `test <path> ... FAILED`) or `forge`
+  (Foundry's `[FAIL: ...] <name>(...)` lines, each named `<Contract>::<name>`, and listed once
+  though forge repeats them in its summary). A test command that fails with no failing test is a
+  build error, and stops the run.
 - fuzz: [Crucible](https://github.com/asymmetric-research/crucible)'s (`[FUZZ_FINDING] [...]`). The
   fuzzer is meant to run until stopped. Unless it has already printed the finding the row
   expects, one that exits before `fuzz_seconds`, or never prints `fuzz_alive` (default
@@ -93,7 +95,7 @@ any other agent. It lists the traps that made our own rows read wrong.
 - [psyto/openhl-solana](https://github.com/psyto/openhl-solana), Chapter 11 (positions and
   liquidation): the handlers were written with Claude on 2026-05-23. A fuzzer found a
   cross-market oracle hole in them five and a half months later. All 17 rows are re-measured in CI
-  ([`fuzz/positions/claims.toml`](https://github.com/psyto/openhl-solana/blob/main/fuzz/positions/claims.toml)).
+  ([`fuzz/positions/unproven.toml`](https://github.com/psyto/openhl-solana/blob/main/fuzz/positions/unproven.toml)).
   Of the 17, 11 are caught by the fuzzer, 2 by a test only and 4 are refused by something else.
 - The same repository, Chapter 12 (the trading vault): 31 rows, written by a fresh agent session
   that had only the skill. 12 were unproven at first. One of them mattered: with
@@ -101,11 +103,17 @@ any other agent. It lists the traps that made our own rows read wrong.
   overflow checks), and a holder of 100,000 shares took the vault's whole 200,000. A test now
   states the rule. The other eleven are explained row by row in the chapter
   ([`fuzz/vault/unproven.toml`](https://github.com/psyto/openhl-solana/blob/main/fuzz/vault/unproven.toml)).
+- A Solidity contract written with Claude on 2026-11-15 (Foundry, not public yet): 38 checks,
+  measured with `test_format = "forge"`. 18 were unproven at first, as predicted row for row; three
+  of them would have lost money without their check (a fee taken from a round still pending, or
+  from a void round, and a one-sided round paying no one). Tests were added for 11; the other 7
+  are redundant, harmless or refused elsewhere, each said so in its row.
 
 ## Status
 
-0.1, used on one repository so far (two chapters). Planned next: test output from Foundry and other runners, and
-finding the checks automatically (from [solinv](https://github.com/psyto/solinv) for Solana programs).
+0.2: cargo test and Foundry. Used on two repositories (a Rust/Solana one and a Solidity one).
+Planned next: other test runners, and finding the checks automatically (from
+[solinv](https://github.com/psyto/solinv) for Solana programs).
 
 ## License
 

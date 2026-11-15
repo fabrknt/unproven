@@ -37,9 +37,10 @@ rows. What it reads, today:
 
 - tests: `cargo test`'s output (`test <path> ... FAILED`). A test command that fails with no
   failing test is a build error, and stops the run.
-- fuzz: [Crucible](https://github.com/asymmetric-research/crucible)'s (`[FUZZ_FINDING] [...]`). A
-  fuzzer that exits early or never prints `fuzz_alive` (default `[FUZZ_PULSE]`) stops the run,
-  so a fuzzer that did not run is never read as "no finding".
+- fuzz: [Crucible](https://github.com/asymmetric-research/crucible)'s (`[FUZZ_FINDING] [...]`). The
+  fuzzer is meant to run until stopped. Unless it has already printed the finding the row
+  expects, one that exits before `fuzz_seconds`, or never prints `fuzz_alive` (default
+  `[FUZZ_PULSE]`), stops the run, so a fuzzer that did not run is never read as "no finding".
 - probe: your own command, one line per call: `PROBE <spec> | <variant> | ok=<bool> | <log>...`.
 
 A check is deleted by replacing `find` inside the function that starts at `in_fn`, to its

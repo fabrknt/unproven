@@ -671,8 +671,9 @@ fn fuzz(
     };
     loop {
         if child.try_wait().ok().flatten().is_some() {
-            // Read what it printed before it went.
-            while let Ok(line) = rx.recv_timeout(Duration::from_millis(200)) {
+            // Read what it printed before it went: until the pipe closes,
+            // or, if something it started still holds it, a quiet second.
+            while let Ok(line) = rx.recv_timeout(Duration::from_secs(1)) {
                 if take(line, &mut findings, &mut alive, &mut tail) {
                     hit = true;
                     break;
@@ -780,7 +781,26 @@ fn backup_of(file: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// The backup is written in full to a temporary name and then renamed, so
+/// a backup that exists is always a whole copy of the original.
+fn publish_backup(backup: &Path, original: &str) -> std::io::Result<()> {
+    let tmp = partial_of(backup);
+    let mut f = std::fs::File::create(&tmp)?;
+    std::io::Write::write_all(&mut f, original.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, backup)
+}
+
+fn partial_of(backup: &Path) -> PathBuf {
+    let mut name = backup.as_os_str().to_owned();
+    name.push(".partial");
+    PathBuf::from(name)
+}
+
 fn restore_backup(file: &Path) {
+    // A partial backup never became the backup; the file was not changed.
+    let _ = std::fs::remove_file(partial_of(&backup_of(file)));
     let backup = backup_of(file);
     if backup.exists() {
         std::fs::rename(&backup, file).unwrap_or_else(|e| {
@@ -808,7 +828,7 @@ fn apply(file: &Path, original: &str, mutated: &str) {
                 "{} already exists; refusing to overwrite it",
                 backup.display()
             ))
-        } else if let Err(e) = std::fs::write(&backup, original) {
+        } else if let Err(e) = publish_backup(&backup, original) {
             Err(format!("{}: {e}", backup.display()))
         } else {
             *editing = Some(file.to_path_buf());
@@ -960,6 +980,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(found, vec!["[FUZZ_FINDING] [x] boom".to_string()]);
+    }
+
+    #[test]
+    fn a_partial_backup_is_never_restored() {
+        let dir = std::env::temp_dir().join(format!("unproven-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("lib.rs");
+        std::fs::write(&file, "intact").unwrap();
+        std::fs::write(partial_of(&backup_of(&file)), "trunc").unwrap();
+        restore_backup(&file);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "intact");
+        assert!(!partial_of(&backup_of(&file)).exists());
+        publish_backup(&backup_of(&file), "intact").unwrap();
+        std::fs::write(&file, "mutated").unwrap();
+        restore_backup(&file);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "intact");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

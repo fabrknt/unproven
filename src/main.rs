@@ -95,6 +95,9 @@ struct Outcome {
 static EDITING: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// The fuzzer's process group, so a signal can stop it.
 static FUZZ_PGID: AtomicI32 = AtomicI32::new(0);
+/// `<root>/.unproven.lock`, held for the whole run: two runs in one
+/// repository would read each other's deletions as the original.
+static LOCK: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// Held while the fuzzer is spawned and its group recorded, so a signal
 /// cannot fall between the two and leave the group running.
 static SPAWNING: Mutex<()> = Mutex::new(());
@@ -124,6 +127,7 @@ fn main() {
     ctrlc::set_handler(|| {
         stop_fuzzer();
         put_back(true);
+        release_lock();
         std::process::exit(130);
     })
     .unwrap_or_else(|e| die(&format!("signal handler: {e}")));
@@ -131,6 +135,7 @@ fn main() {
     std::panic::set_hook(Box::new(move |info| {
         stop_fuzzer();
         put_back(true);
+        release_lock();
         default_hook(info);
     }));
 
@@ -158,6 +163,8 @@ fn main() {
             ));
         }
     }
+
+    take_lock(&root);
 
     // A run killed half-way leaves a backup; put the original back first.
     for c in &claims.claim {
@@ -206,7 +213,7 @@ fn main() {
                 "BASELINE the code as it is: findings {:?}, failed tests {:?}",
                 out.findings, out.failed_tests
             );
-            std::process::exit(1);
+            finish(1);
         }
         println!("baseline: no finding, every test passes");
     }
@@ -253,8 +260,9 @@ fn main() {
 
     if missing + mismatched > 0 {
         println!("{mismatched} row(s) measured differently, {missing} row(s) missing from a page");
-        std::process::exit(1);
+        finish(1);
     }
+    release_lock();
 }
 
 const USAGE: &str = "usage: unproven <unproven.toml> [--only <text>] [--no-baseline]
@@ -701,6 +709,27 @@ fn fuzz(
         }
     }
     stop_fuzzer();
+    // Stopped at the clock: read everything it wrote before it stopped, to
+    // the end of the pipe, so a finding printed just before the deadline is
+    // not lost. If the pipe does not close, the output is not known whole.
+    if !hit && !exited {
+        let until = Instant::now() + Duration::from_secs(15);
+        loop {
+            match rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
+                Ok(line) => {
+                    if take(line, &mut findings, &mut alive, &mut tail) {
+                        hit = true;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let _ = child.wait();
+                    FUZZ_PGID.store(0, Ordering::SeqCst);
+                    return Err(format!("`{cmd}` was stopped, but its output did not close"));
+                }
+            }
+        }
+    }
     let status = child.wait().ok();
     FUZZ_PGID.store(0, Ordering::SeqCst);
     // A finding the row expects shows the fuzzer ran. Anything else must
@@ -789,7 +818,12 @@ fn publish_backup(backup: &Path, original: &str) -> std::io::Result<()> {
     std::io::Write::write_all(&mut f, original.as_bytes())?;
     f.sync_all()?;
     drop(f);
-    std::fs::rename(&tmp, backup)
+    std::fs::rename(&tmp, backup)?;
+    // The rename itself must survive a crash before the source is changed.
+    if let Some(dir) = backup.parent() {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
 }
 
 fn partial_of(backup: &Path) -> PathBuf {
@@ -884,7 +918,45 @@ fn die(msg: &str) -> ! {
     eprintln!("unproven: {msg}");
     stop_fuzzer();
     put_back(false);
-    std::process::exit(2);
+    finish(2);
+}
+
+fn finish(code: i32) -> ! {
+    release_lock();
+    std::process::exit(code);
+}
+
+fn take_lock(root: &Path) {
+    let lock = root.join(".unproven.lock");
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock)
+    {
+        Ok(mut f) => {
+            let _ =
+                std::io::Write::write_all(&mut f, format!("{}\n", std::process::id()).as_bytes());
+            *LOCK.lock().unwrap_or_else(|e| e.into_inner()) = Some(lock);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            eprintln!(
+                "unproven: {} exists: another run is going in this repository, or one was killed. \
+                 If none is running, delete it and run again.",
+                lock.display()
+            );
+            std::process::exit(2);
+        }
+        Err(e) => {
+            eprintln!("unproven: {}: {e}", lock.display());
+            std::process::exit(2);
+        }
+    }
+}
+
+fn release_lock() {
+    if let Some(lock) = LOCK.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let _ = std::fs::remove_file(lock);
+    }
 }
 
 #[cfg(test)]

@@ -51,6 +51,11 @@ first and put back after each row, on an error, on Ctrl-C and on SIGTERM. After 
 after a run killed outright, `<file>.unproven-orig` stays next to it; the next run puts it back
 (after a signal it is the same as the file, and can also simply be deleted).
 
+One run at a time per repository: a run holds `.unproven.lock` in the root (add it to
+`.gitignore`) and another run there stops at once. Output is read to the end of the pipe; when
+it cannot be (a process the fuzzer started keeps it open), the run stops with an error rather
+than read what it has as complete.
+
 ## With an AI agent
 
 The agent does the reading: it chooses the checks, writes the rows, predicts, and explains what came back.

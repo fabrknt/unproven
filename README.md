@@ -51,10 +51,22 @@ first and put back after each row, on an error, on Ctrl-C and on SIGTERM. After 
 after a run killed outright, `<file>.unproven-orig` stays next to it; the next run puts it back
 (after a signal it is the same as the file, and can also simply be deleted).
 
-One run at a time per repository: a run holds `.unproven.lock` in the root (add it to
-`.gitignore`) and another run there stops at once. Output is read to the end of the pipe; when
-it cannot be (a process the fuzzer started keeps it open), the run stops with an error rather
-than read what it has as complete.
+Backups and restores are written to a temporary name, synced and renamed, so after a crash the
+file is either the original or the deletion, and a deletion always has its backup.
+
+One run at a time per repository: a run holds `.unproven.lock` in the root and another run there
+stops at once. Add to `.gitignore`:
+
+```
+.unproven.lock
+*.unproven-orig
+*.unproven-orig.partial
+*.unproven-restore
+```
+
+Until the finding a row expects has been seen, the fuzzer's output is read to the end of the
+pipe; when it cannot be (a process the fuzzer started keeps it open) or a read fails, the run
+stops with an error rather than read what it has as complete.
 
 ## With an AI agent
 

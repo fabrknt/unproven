@@ -644,9 +644,22 @@ fn fuzz(
     let mut child = spawned.map_err(|e| format!("{cmd}: {e}"))?;
     let stdout = child.stdout.take().expect("piped");
     let (tx, rx) = mpsc::channel();
+    // Bytes, not `lines()`: output that is not UTF-8 is read lossily
+    // instead of ending the stream, and a read error is passed on.
     std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if tx.send(line).is_err() {
+        let mut reader = BufReader::new(stdout);
+        let mut buf = vec![];
+        loop {
+            buf.clear();
+            let line = match reader.read_until(b'\n', &mut buf) {
+                Ok(0) => break,
+                Ok(_) => Ok(String::from_utf8_lossy(&buf)
+                    .trim_end_matches(['\n', '\r'])
+                    .to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            let failed = line.is_err();
+            if tx.send(line).is_err() || failed {
                 break;
             }
         }
@@ -682,6 +695,7 @@ fn fuzz(
             // Read what it printed before it went: until the pipe closes,
             // or, if something it started still holds it, a quiet second.
             while let Ok(line) = rx.recv_timeout(Duration::from_secs(1)) {
+                let line = line.map_err(|e| format!("reading `{cmd}`: {e}"))?;
                 if take(line, &mut findings, &mut alive, &mut tail) {
                     hit = true;
                     break;
@@ -696,6 +710,7 @@ fn fuzz(
         }
         match rx.recv_timeout(left.min(Duration::from_millis(200))) {
             Ok(line) => {
+                let line = line.map_err(|e| format!("reading `{cmd}`: {e}"))?;
                 if take(line, &mut findings, &mut alive, &mut tail) {
                     hit = true;
                     break;
@@ -717,6 +732,7 @@ fn fuzz(
         loop {
             match rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
                 Ok(line) => {
+                    let line = line.map_err(|e| format!("reading `{cmd}`: {e}"))?;
                     if take(line, &mut findings, &mut alive, &mut tail) {
                         hit = true;
                     }
@@ -820,10 +836,7 @@ fn publish_backup(backup: &Path, original: &str) -> std::io::Result<()> {
     drop(f);
     std::fs::rename(&tmp, backup)?;
     // The rename itself must survive a crash before the source is changed.
-    if let Some(dir) = backup.parent() {
-        std::fs::File::open(dir)?.sync_all()?;
-    }
-    Ok(())
+    sync_dir(backup)
 }
 
 fn partial_of(backup: &Path) -> PathBuf {
@@ -833,18 +846,20 @@ fn partial_of(backup: &Path) -> PathBuf {
 }
 
 fn restore_backup(file: &Path) {
-    // A partial backup never became the backup; the file was not changed.
+    // A partial backup never became the backup, and a half-written restore
+    // never replaced the file; neither is a copy of anything.
     let _ = std::fs::remove_file(partial_of(&backup_of(file)));
+    let _ = std::fs::remove_file(restoring_of(file));
     let backup = backup_of(file);
     if backup.exists() {
-        std::fs::rename(&backup, file).unwrap_or_else(|e| {
+        if let Err(e) = std::fs::rename(&backup, file).and_then(|_| sync_dir(file)) {
             eprintln!(
                 "unproven: could not put {} back from {}: {e}",
                 file.display(),
                 backup.display()
             );
-            std::process::exit(2);
-        });
+            finish(2);
+        }
         println!("restored {} from an interrupted run", file.display());
     }
 }
@@ -885,8 +900,10 @@ fn put_back(keep_backup: bool) {
         return;
     };
     let backup = backup_of(&file);
+    // Written whole to a temporary name, synced and renamed over the file,
+    // and the directory synced: only then is the backup let go.
     let restored = std::fs::read(&backup)
-        .and_then(|original| std::fs::write(&file, &original).map(|_| original))
+        .and_then(|original| durable_replace(&file, &original).map(|_| original))
         .and_then(|original| std::fs::read(&file).map(|now| now == original));
     match restored {
         Ok(true) => {
@@ -901,9 +918,37 @@ fn put_back(keep_backup: bool) {
                 file.display(),
                 backup.display()
             );
-            std::process::exit(2);
+            finish(2);
         }
     }
+}
+
+/// Replaces `file` with `bytes` so that after a crash it is either the old
+/// file or the new one, never part of either. Keeps the file's permissions.
+fn durable_replace(file: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = restoring_of(file);
+    let mut f = std::fs::File::create(&tmp)?;
+    std::io::Write::write_all(&mut f, bytes)?;
+    if let Ok(meta) = std::fs::metadata(file) {
+        f.set_permissions(meta.permissions())?;
+    }
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, file)?;
+    sync_dir(file)
+}
+
+fn sync_dir(file: &Path) -> std::io::Result<()> {
+    match file.parent() {
+        Some(dir) => std::fs::File::open(dir)?.sync_all(),
+        None => Ok(()),
+    }
+}
+
+fn restoring_of(file: &Path) -> PathBuf {
+    let mut name = file.as_os_str().to_owned();
+    name.push(".unproven-restore");
+    PathBuf::from(name)
 }
 
 fn default_fuzz_seconds() -> u64 {

@@ -42,6 +42,7 @@ rows. What it reads, today:
   expects, one that exits before `fuzz_seconds`, or never prints `fuzz_alive` (default
   `[FUZZ_PULSE]`), stops the run, so a fuzzer that did not run is never read as "no finding".
 - probe: your own command, one line per call: `PROBE <spec> | <variant> | ok=<bool> | <log>...`.
+  A row's `log` is looked for inside one of the fields after `ok=`, not across ` | `.
 
 A check is deleted by replacing `find` inside the function that starts at `in_fn`, to its
 matching closing brace (comments, nested ones too, strings, raw strings and char literals are

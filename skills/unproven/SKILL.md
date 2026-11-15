@@ -59,7 +59,8 @@ closing brace); if not, the CLI stops rather than guess, so add context to make 
 - `refused = { probe = "<spec> | <variant>", log = "..." }`: nothing above notices, because
   something else refuses the call (the runtime, another check, the token program). The probe
   command prints one line per call, `PROBE <spec> | <variant> | ok=<bool> | <log>...`; the line
-  is picked by spec and variant exactly, must say `ok=false`, and `log` names what refused it.
+  is picked by spec and variant exactly, must say `ok=false`, and `log` names what refused it,
+  as text inside one field (not spanning ` | `).
 - none of these: **unproven**. Nothing in the repository notices the check is gone.
 
 ## 3. Predict, then measure

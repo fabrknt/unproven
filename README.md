@@ -105,7 +105,8 @@ any other agent. It lists the traps that made our own rows read wrong.
   overflow checks), and a holder of 100,000 shares took the vault's whole 200,000. A test now
   states the rule. The other eleven are explained row by row in the chapter
   ([`fuzz/vault/unproven.toml`](https://github.com/psyto/openhl-solana/blob/main/fuzz/vault/unproven.toml)).
-- A Solidity contract written with Claude on 2026-11-15 (Foundry, not public yet): 38 checks,
+- [fabrknt/fivemin](https://github.com/fabrknt/fivemin), a Solidity contract written with Claude on
+  2026-11-15 ([`unproven.toml`](https://github.com/fabrknt/fivemin/blob/main/unproven.toml)): 38 checks,
   measured with `test_format = "forge"`. 18 were unproven at first, as predicted row for row; three
   of them would have lost money without their check (a fee taken from a round still pending, or
   from a void round, and a one-sided round paying no one). Tests were added for 11; the other 7

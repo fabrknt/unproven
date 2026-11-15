@@ -98,8 +98,16 @@ static FUZZ_PGID: AtomicI32 = AtomicI32::new(0);
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let Some(path) = args.first() else {
-        eprintln!("usage: unproven <unproven.toml> [--only <text>] [--no-baseline]");
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{USAGE}");
+        return;
+    }
+    if args.iter().any(|a| a == "-V" || a == "--version") {
+        println!("unproven {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    let Some(path) = args.first().filter(|a| !a.starts_with('-')) else {
+        eprintln!("{USAGE}");
         std::process::exit(2);
     };
     let only = args.iter().position(|a| a == "--only").and_then(|i| args.get(i + 1));
@@ -144,12 +152,19 @@ fn main() {
         delete_check(&src, c).unwrap_or_else(|e| die(&format!("{}: {e}", c.row)));
     }
 
-    let mut bad = 0;
+    let selected: Vec<&Claim> = claims.claim.iter().filter(|c| only.is_none_or(|o| c.row.contains(o.as_str()))).collect();
+    if selected.is_empty() {
+        die(&format!("no row contains {only:?}"));
+    }
+
+    // Only the rows being run are looked for, so `--only` while a page is
+    // being written does not drown the result.
+    let mut missing = 0;
     for doc in &claims.docs {
         let body = std::fs::read_to_string(root.join(doc)).unwrap_or_else(|e| die(&format!("{doc}: {e}")));
-        for c in claims.claim.iter().filter(|c| !std::iter::once(&c.row).chain(&c.also).any(|r| body.contains(r.as_str()))) {
+        for c in selected.iter().filter(|c| !std::iter::once(&c.row).chain(&c.also).any(|r| body.contains(r.as_str()))) {
             println!("MISSING  {doc} has no row {}", c.row);
-            bad += 1;
+            missing += 1;
         }
     }
 
@@ -167,7 +182,9 @@ fn main() {
     }
 
     let mut tally = [0usize; 4];
-    for c in claims.claim.iter().filter(|c| only.is_none_or(|o| c.row.contains(o.as_str()))) {
+    let mut mismatched = 0;
+    for (i, c) in selected.iter().enumerate() {
+        eprintln!("[{}/{}] {} ...", i + 1, selected.len(), c.row);
         let file = root.join(&c.file);
         let original = std::fs::read_to_string(&file).unwrap_or_else(|e| die(&format!("{}: {e}", c.file)));
         let mutated = delete_check(&original, c).unwrap_or_else(|e| die(&format!("{}: {e}", c.row)));
@@ -181,8 +198,11 @@ fn main() {
         tally[kind(c) as usize] += 1;
         if problems.is_empty() {
             println!("ok       {}  [{}]", c.row, kind(c).label());
+            if let Some(why) = evidence(c, &out) {
+                println!("           {why}");
+            }
         } else {
-            bad += 1;
+            mismatched += 1;
             println!("MISMATCH {}", c.row);
             for p in problems {
                 println!("           {p}");
@@ -197,10 +217,39 @@ fn main() {
         tally[Kind::Fuzz as usize], tally[Kind::Test as usize], tally[Kind::Refused as usize], tally[Kind::Unproven as usize]
     );
 
-    if bad > 0 {
-        println!("{bad} row(s) no longer read the way the file says");
+    if missing + mismatched > 0 {
+        println!("{mismatched} row(s) measured differently, {missing} row(s) missing from a page");
         std::process::exit(1);
     }
+}
+
+const USAGE: &str = "usage: unproven <unproven.toml> [--only <text>] [--no-baseline]
+
+Deletes each check listed in <unproven.toml> in turn, rebuilds, reruns the
+tests (and the fuzzer and probe, if configured), and says for each row
+whether it still reads the way the file says.
+
+  --only <text>   run only the rows whose `row` contains <text>
+  --no-baseline   skip the run on the unchanged code first
+  -h, --help      this text
+  -V, --version   the version
+
+Exit codes: 0 every row holds, 1 a row does not, 2 something could not run.
+Format of the file: https://github.com/fabrknt/unproven#use-it";
+
+/// What the row was decided on, so a reader can see the `ok` is earned.
+fn evidence(c: &Claim, out: &Outcome) -> Option<String> {
+    let short = |s: &str| s.chars().take(140).collect::<String>();
+    if let Some(want) = &c.fuzz {
+        return out.findings.iter().find(|f| matches(f, want)).map(|f| format!("finding: {}", short(f)));
+    }
+    if !c.tests_fail.is_empty() {
+        return Some(format!("failed: {}", out.failed_tests.join(", ")));
+    }
+    if let Some(r) = &c.refused {
+        return out.probe.iter().find(|l| probe_line(l, &r.probe).is_some()).map(|l| format!("probe: {}", short(l)));
+    }
+    Some("no finding, no failing test".into())
 }
 
 /// What a row says notices the deletion, the strongest first.

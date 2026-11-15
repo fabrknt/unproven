@@ -191,8 +191,7 @@ fn main() {
         let file = root.join(&c.file);
         let original = std::fs::read_to_string(&file).unwrap_or_else(|e| die(&format!("{}: {e}", c.file)));
         let mutated = delete_check(&original, c).unwrap_or_else(|e| die(&format!("{}: {e}", c.row)));
-        set_aside(&file, &original);
-        std::fs::write(&file, mutated).unwrap_or_else(|e| die(&format!("{}: {e}", c.file)));
+        apply(&file, &original, &mutated);
         run_ok(&root, &claims.build);
         let out = measure(&root, &claims, Some(c));
         put_back(false);
@@ -528,24 +527,46 @@ fn fuzz(root: &Path, cmd: &str, seconds: u64, alive_marker: &str, expect: Option
     let mut tail: Vec<String> = vec![];
     let mut hit = false;
     let mut exited = false;
+    // The child is polled as well as its output: a fuzzer can exit while
+    // something it started still holds stdout open.
+    let take = |line: String, findings: &mut Vec<String>, alive: &mut bool, tail: &mut Vec<String>| -> bool {
+        if line.starts_with("[FUZZ_FINDING] [") {
+            let hit = expect.is_none_or(|e| matches(&line, e));
+            findings.push(line);
+            hit
+        } else {
+            *alive |= line.contains(alive_marker);
+            tail.push(line);
+            if tail.len() > 20 {
+                tail.remove(0);
+            }
+            false
+        }
+    };
     loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        match rx.recv_timeout(left) {
-            Ok(line) if line.starts_with("[FUZZ_FINDING] [") => {
-                hit = expect.is_some_and(|e| matches(&line, e)) || expect.is_none();
-                findings.push(line);
-                if hit {
+        if child.try_wait().ok().flatten().is_some() {
+            // Read what it printed before it went.
+            while let Ok(line) = rx.recv_timeout(Duration::from_millis(200)) {
+                if take(line, &mut findings, &mut alive, &mut tail) {
+                    hit = true;
                     break;
                 }
             }
+            exited = !hit;
+            break;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(left.min(Duration::from_millis(200))) {
             Ok(line) => {
-                alive |= line.contains(alive_marker);
-                tail.push(line);
-                if tail.len() > 20 {
-                    tail.remove(0);
+                if take(line, &mut findings, &mut alive, &mut tail) {
+                    hit = true;
+                    break;
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 exited = true;
                 break;
@@ -625,15 +646,26 @@ fn restore_backup(file: &Path) {
     }
 }
 
-/// Writes the original next to the file before it is changed. The backup is
-/// removed only once the original is back and reads back the same.
-fn set_aside(file: &Path, original: &str) {
+/// Writes the original next to the file, then the deletion into it. Both
+/// happen under the lock `put_back` takes, so a signal either comes before
+/// (nothing to restore) or after (the deletion is there to undo), never in
+/// between. `die` is called only once the lock is released.
+fn apply(file: &Path, original: &str, mutated: &str) {
     let backup = backup_of(file);
-    if backup.exists() {
-        die(&format!("{} already exists; refusing to overwrite it", backup.display()));
+    let result = {
+        let mut editing = EDITING.lock().unwrap_or_else(|e| e.into_inner());
+        if backup.exists() {
+            Err(format!("{} already exists; refusing to overwrite it", backup.display()))
+        } else if let Err(e) = std::fs::write(&backup, original) {
+            Err(format!("{}: {e}", backup.display()))
+        } else {
+            *editing = Some(file.to_path_buf());
+            std::fs::write(file, mutated).map_err(|e| format!("{}: {e}", file.display()))
+        }
+    };
+    if let Err(e) = result {
+        die(&e);
     }
-    std::fs::write(&backup, original).unwrap_or_else(|e| die(&format!("{}: {e}", backup.display())));
-    *EDITING.lock().unwrap_or_else(|e| e.into_inner()) = Some(file.to_path_buf());
 }
 
 /// Puts the file being edited back from its backup. On failure the backup
@@ -742,6 +774,8 @@ mod tests {
         assert_eq!(fuzz(&dir, pulse, 1, alive, None), Ok(vec![]));
         assert!(fuzz(&dir, "printf '[FUZZ_PULSE]\\n'; exit 0", 3, alive, None).unwrap_err().contains("exited before"));
         assert!(fuzz(&dir, "sleep 5", 1, alive, None).unwrap_err().contains("never printed"));
+        // Exits, while a process it started keeps stdout open.
+        assert!(fuzz(&dir, "echo '[FUZZ_PULSE]'; (sleep 5) & exit 0", 3, alive, None).unwrap_err().contains("exited before"));
         let found = fuzz(&dir, "echo '[FUZZ_FINDING] [x] boom'; sleep 5", 3, alive, Some(&["boom".to_string()][..])).unwrap();
         assert_eq!(found, vec!["[FUZZ_FINDING] [x] boom".to_string()]);
     }

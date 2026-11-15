@@ -1,6 +1,7 @@
 # unproven
 
-For each check in code an AI wrote: delete it, and see whether anything notices.
+Find the checks in AI-written code that nothing proves. For each check: delete it, and see
+whether anything notices. Part of [Fabrknt](https://fabrknt.com)'s AI-driven crypto development.
 
 AI agents write more and more of the code we ship. It compiles, the tests pass, and it may still
 not do what it says. unproven makes that concrete. You list the checks in a piece of code (each
@@ -71,10 +72,16 @@ any other agent. It lists the traps that made our own rows read wrong.
   cross-market oracle hole in them five and a half months later. All 17 rows are re-measured in CI
   ([`fuzz/positions/claims.toml`](https://github.com/psyto/openhl-solana/blob/main/fuzz/positions/claims.toml)).
   Of the 17, 11 are caught by the fuzzer, 2 by a test only and 4 are refused by something else.
+- The same repository, Chapter 12 (the trading vault): 31 rows, written by a fresh agent session
+  that had only the skill. 12 were unproven at first. One of them mattered: with
+  `share.shares >= shares` deleted, the share count wraps around (the program is built without
+  overflow checks), and a holder of 100,000 shares took the vault's whole 200,000. A test now
+  states the rule. The other eleven are explained row by row in the chapter
+  ([`fuzz/vault/unproven.toml`](https://github.com/psyto/openhl-solana/blob/main/fuzz/vault/unproven.toml)).
 
 ## Status
 
-0.1, used on one repository so far. Planned next: test output from Foundry and other runners, and
+0.1, used on one repository so far (two chapters). Planned next: test output from Foundry and other runners, and
 finding the checks automatically (from [solinv](https://github.com/psyto/solinv) for Solana programs).
 
 ## License

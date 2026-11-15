@@ -95,6 +95,9 @@ struct Outcome {
 static EDITING: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// The fuzzer's process group, so a signal can stop it.
 static FUZZ_PGID: AtomicI32 = AtomicI32::new(0);
+/// Held while the fuzzer is spawned and its group recorded, so a signal
+/// cannot fall between the two and leave the group running.
+static SPAWNING: Mutex<()> = Mutex::new(());
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -302,8 +305,9 @@ fn delete_check(src: &str, c: &Claim) -> Result<String, String> {
 }
 
 /// The end of the block whose `{` is the first one at or after `from`,
-/// skipping braces in comments, string literals and char literals. Raw
-/// strings are not understood; a `{` or `}` in one can end the block early.
+/// skipping braces in line and (nested) block comments, string and raw
+/// string literals, and char literals. It is a scanner for Rust and C-like
+/// sources, not a parser: a brace produced by a macro is not seen.
 fn function_end(src: &str, from: usize) -> Option<usize> {
     let b = src.as_bytes();
     let mut i = from;
@@ -317,11 +321,37 @@ fn function_end(src: &str, from: usize) -> Option<usize> {
                 }
             }
             b'/' if b.get(i + 1) == Some(&b'*') => {
+                let mut nest = 1;
                 i += 2;
-                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                while i + 1 < b.len() && nest > 0 {
+                    if b[i] == b'/' && b[i + 1] == b'*' {
+                        nest += 1;
+                        i += 2;
+                    } else if b[i] == b'*' && b[i + 1] == b'/' {
+                        nest -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                i -= 1;
+            }
+            // r"..", r#".."#, br#".."#: ends at `"` and the same number of `#`.
+            b'r' if (i == 0 || !is_ident(b[i - 1]) || (b[i - 1] == b'b' && (i < 2 || !is_ident(b[i - 2]))))
+                && raw_hashes(b, i + 1).is_some() =>
+            {
+                let hashes = raw_hashes(b, i + 1).unwrap_or(0);
+                i += 1 + hashes + 1;
+                loop {
+                    if i >= b.len() {
+                        return None;
+                    }
+                    if b[i] == b'"' && b[i + 1..].iter().take(hashes).filter(|c| **c == b'#').count() == hashes {
+                        i += hashes;
+                        break;
+                    }
                     i += 1;
                 }
-                i += 1;
             }
             b'"' => {
                 i += 1;
@@ -357,6 +387,16 @@ fn function_end(src: &str, from: usize) -> Option<usize> {
     None
 }
 
+fn is_ident(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_'
+}
+
+/// At `at`: `#`* then `"`, the opening of a raw string; returns the count.
+fn raw_hashes(b: &[u8], at: usize) -> Option<usize> {
+    let n = b[at.min(b.len())..].iter().take_while(|c| **c == b'#').count();
+    (b.get(at + n) == Some(&b'"')).then_some(n)
+}
+
 fn measure(root: &Path, claims: &Claims, c: Option<&Claim>) -> Outcome {
     let (ok, tests) = output(root, &claims.test);
     if !tests.contains("test result:") {
@@ -374,7 +414,7 @@ fn measure(root: &Path, claims: &Claims, c: Option<&Claim>) -> Outcome {
     }
     let expect = c.and_then(|c| c.fuzz.clone());
     let findings = match &claims.fuzz {
-        Some(cmd) => fuzz(root, cmd, claims.fuzz_seconds, &claims.fuzz_alive, expect.as_deref()),
+        Some(cmd) => fuzz(root, cmd, claims.fuzz_seconds, &claims.fuzz_alive, expect.as_deref()).unwrap_or_else(|e| die(&e)),
         None => vec![],
     };
     let probe = match (c.and_then(|c| c.refused.as_ref()), &claims.probe) {
@@ -432,8 +472,10 @@ fn compare(c: &Claim, out: &Outcome) -> Vec<String> {
     problems
 }
 
+/// `want` is a test's full path, or a bare name (no `::`) matching its
+/// last segment.
 fn test_is(full: &str, want: &str) -> bool {
-    full == want || full.ends_with(&format!("::{want}"))
+    full == want || (!want.contains("::") && full.rsplit("::").next() == Some(want))
 }
 
 /// `PROBE <spec> | <variant> | ...` for exactly this `<spec> | <variant>`;
@@ -451,17 +493,26 @@ fn matches(finding: &str, want: &[String]) -> bool {
 /// Runs the fuzzer for up to `seconds`, stopping early at the finding the
 /// row expects. Crucible checks its own `--timeout` only every 1,000
 /// iterations (asymmetric-research/crucible#25), so the clock is kept here.
-fn fuzz(root: &Path, cmd: &str, seconds: u64, alive_marker: &str, expect: Option<&[String]>) -> Vec<String> {
+/// The fuzzer runs until it is stopped: one that exits before the clock,
+/// or never prints `alive_marker`, did not measure anything, and its
+/// silence is an error, not "no finding".
+fn fuzz(root: &Path, cmd: &str, seconds: u64, alive_marker: &str, expect: Option<&[String]>) -> Result<Vec<String>, String> {
     use std::os::unix::process::CommandExt;
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(format!("{cmd} 2>&1"))
-        .current_dir(root)
-        .stdout(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .unwrap_or_else(|e| die(&format!("{cmd}: {e}")));
-    FUZZ_PGID.store(child.id() as i32, Ordering::SeqCst);
+    let spawned = {
+        let _g = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
+        let spawned = Command::new("sh")
+            .arg("-c")
+            .arg(format!("{cmd} 2>&1"))
+            .current_dir(root)
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn();
+        if let Ok(child) = &spawned {
+            FUZZ_PGID.store(child.id() as i32, Ordering::SeqCst);
+        }
+        spawned
+    };
+    let mut child = spawned.map_err(|e| format!("{cmd}: {e}"))?;
     let stdout = child.stdout.take().expect("piped");
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -504,23 +555,24 @@ fn fuzz(root: &Path, cmd: &str, seconds: u64, alive_marker: &str, expect: Option
     stop_fuzzer();
     let status = child.wait().ok();
     FUZZ_PGID.store(0, Ordering::SeqCst);
-    // A fuzzer that stopped on its own before the clock, or never showed
-    // it was running, measured nothing; its silence is not "no finding".
+    // A finding the row expects shows the fuzzer ran. Anything else must
+    // have run to the clock, saying all along that it was alive.
     if !hit {
-        if exited && !status.is_some_and(|s| s.success()) {
-            die(&format!("`{cmd}` exited early ({status:?}):\n{}", tail.join("\n")));
+        if exited {
+            return Err(format!("`{cmd}` exited before {seconds}s ({status:?}):\n{}", tail.join("\n")));
         }
         if !alive {
-            die(&format!("`{cmd}` never printed `{alive_marker}`:\n{}", tail.join("\n")));
+            return Err(format!("`{cmd}` never printed `{alive_marker}`:\n{}", tail.join("\n")));
         }
     }
     findings.sort();
     findings.dedup();
-    findings
+    Ok(findings)
 }
 
 /// Interrupts the fuzzer's process group, then kills whatever is left.
 fn stop_fuzzer() {
+    let _g = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
     let pgid = FUZZ_PGID.load(Ordering::SeqCst);
     if pgid <= 0 {
         return;
@@ -588,7 +640,10 @@ fn set_aside(file: &Path, original: &str) {
 /// stays on disk and the run stops: no later row may start from a file that
 /// is not the original. `keep_backup` leaves it for the next run as well.
 fn put_back(keep_backup: bool) {
-    let Some(file) = EDITING.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+    // The lock is held until the file is back, so a signal arriving
+    // meanwhile waits for it instead of finding nothing to restore.
+    let mut editing = EDITING.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(file) = editing.clone() else {
         return;
     };
     let backup = backup_of(&file);
@@ -596,9 +651,11 @@ fn put_back(keep_backup: bool) {
         .and_then(|original| std::fs::write(&file, &original).map(|_| original))
         .and_then(|original| std::fs::read(&file).map(|now| now == original));
     match restored {
-        Ok(true) if keep_backup => {}
         Ok(true) => {
-            let _ = std::fs::remove_file(&backup);
+            *editing = None;
+            if !keep_backup {
+                let _ = std::fs::remove_file(&backup);
+            }
         }
         _ => {
             eprintln!(
@@ -668,9 +725,32 @@ mod tests {
     }
 
     #[test]
+    fn raw_strings_and_nested_comments_do_not_end_the_function() {
+        let src = "fn a() {\n    let s = r#\"}\"#; let t = br\"}\";\n    /* outer /* } */ } */\n    check();\n}\nfn b() { check(); }\n";
+        assert!(delete_check(src, &claim("fn a(", "check();")).unwrap().contains("    X\n}\nfn b() { check(); }"));
+        // A raw identifier is not a raw string.
+        let src = "fn a() {\n    let r#type = 1;\n    check();\n}\n";
+        assert!(delete_check(src, &claim("fn a(", "check();")).is_ok());
+    }
+
+    #[test]
+    fn a_fuzzer_that_did_not_run_is_an_error() {
+        // One test, so the runs do not share FUZZ_PGID.
+        let dir = std::env::temp_dir();
+        let alive = "[FUZZ_PULSE]";
+        let pulse = "while true; do echo '[FUZZ_PULSE]'; sleep 0.2; done";
+        assert_eq!(fuzz(&dir, pulse, 1, alive, None), Ok(vec![]));
+        assert!(fuzz(&dir, "printf '[FUZZ_PULSE]\\n'; exit 0", 3, alive, None).unwrap_err().contains("exited before"));
+        assert!(fuzz(&dir, "sleep 5", 1, alive, None).unwrap_err().contains("never printed"));
+        let found = fuzz(&dir, "echo '[FUZZ_FINDING] [x] boom'; sleep 5", 3, alive, Some(&["boom".to_string()][..])).unwrap();
+        assert_eq!(found, vec!["[FUZZ_FINDING] [x] boom".to_string()]);
+    }
+
+    #[test]
     fn test_names_match_by_path_or_unambiguous_last_segment() {
         assert!(test_is("tests::a::rejects", "rejects"));
-        assert!(test_is("tests::a::rejects", "a::rejects"));
+        assert!(test_is("tests::a::rejects", "tests::a::rejects"));
+        assert!(!test_is("tests::other::a::rejects", "a::rejects"));
         assert!(!test_is("tests::a::rejects_more", "rejects"));
         let mut c = claim("fn a(", "x");
         c.tests_fail = vec!["rejects".into()];

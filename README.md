@@ -42,7 +42,9 @@ rows. What it reads, today:
 - probe: your own command, one line per call: `PROBE <spec> | <variant> | ok=<bool> | <log>...`.
 
 A check is deleted by replacing `find` inside the function that starts at `in_fn`, to its
-matching closing brace. Both must occur exactly once. The original is written next to the file
+matching closing brace (comments, nested ones too, strings, raw strings and char literals are
+skipped; it is a scanner, not a parser, so a brace a macro produces is not seen). Both must
+occur exactly once. The original is written next to the file
 first and put back after each row, on an error, on Ctrl-C and on SIGTERM. After a signal, and
 after a run killed outright, `<file>.unproven-orig` stays next to it; the next run puts it back
 (after a signal it is the same as the file, and can also simply be deleted).

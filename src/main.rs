@@ -37,8 +37,8 @@ struct Claims {
     build: String,
     /// Runs the tests. Failures are read in `test_format`.
     test: String,
-    /// `cargo` (default): `test <path::name> ... FAILED`. `forge`: Foundry's
-    /// `[FAIL: ...] <name>(...)` lines, named `<Contract>::<name>`.
+    /// `cargo` (default): `test <path::name> ... FAILED`. `forge`: the JSON that
+    /// `forge test --json` prints, each test named `<file>::<Contract>::<name>`.
     #[serde(default)]
     test_format: TestFormat,
     /// Runs the fuzzer; findings are lines starting `[FUZZ_FINDING] [`.
@@ -497,10 +497,7 @@ fn raw_hashes(b: &[u8], at: usize) -> Option<usize> {
 
 fn measure(root: &Path, claims: &Claims, c: Option<&Claim>) -> Outcome {
     let (ok, tests) = output(root, &claims.test);
-    if !tests_ran(claims.test_format, &tests) {
-        die(&format!("the tests did not run:\n{tests}"));
-    }
-    let failed_tests = failed_tests(claims.test_format, &tests);
+    let failed_tests = failed_tests(claims.test_format, &tests).unwrap_or_else(|e| die(&e));
     // A failing command with no failing test is a build error or a crash,
     // not a measurement.
     if !ok && failed_tests.is_empty() {
@@ -986,63 +983,71 @@ fn default_fuzz_seconds() -> u64 {
     45
 }
 
-/// Whether the output shows a test run finished (a build error shows neither).
-fn tests_ran(format: TestFormat, out: &str) -> bool {
+/// The failed tests, each once, in the order they appear; an error when the output does not show a
+/// finished run (a build error), or shows a run that measured less than it says.
+fn failed_tests(format: TestFormat, out: &str) -> Result<Vec<String>, String> {
     match format {
-        TestFormat::Cargo => out.contains("test result:"),
-        TestFormat::Forge => out.contains("Suite result:"),
+        TestFormat::Cargo => {
+            if !out.contains("test result:") {
+                return Err(format!("the tests did not run:\n{out}"));
+            }
+            Ok(out
+                .lines()
+                .filter_map(|l| l.strip_prefix("test ")?.strip_suffix(" ... FAILED"))
+                .map(String::from)
+                .collect())
+        }
+        TestFormat::Forge => forge_failures(out),
     }
 }
 
-/// The failed tests, each once, in the order they first appear.
-fn failed_tests(format: TestFormat, out: &str) -> Vec<String> {
-    let mut failed: Vec<String> = vec![];
-    match format {
-        TestFormat::Cargo => {
-            for l in out.lines() {
-                if let Some(n) = l
-                    .strip_prefix("test ")
-                    .and_then(|l| l.strip_suffix(" ... FAILED"))
-                {
-                    failed.push(n.to_string());
-                }
-            }
-        }
-        TestFormat::Forge => {
-            // `Ran 14 tests for test/FiveMin.t.sol:FiveMinTest` opens a suite; forge repeats
-            // each failure under `Encountered 1 failing test in <path>:<Contract>` at the end.
-            let mut contract = "";
-            for l in out.lines() {
-                let suite = l
-                    .strip_prefix("Ran ")
-                    .and_then(|r| r.split_once(" for "))
-                    .or_else(|| {
-                        l.strip_prefix("Encountered ")
-                            .and_then(|r| r.split_once(" in "))
-                    });
-                if let Some((_, path)) = suite {
-                    contract = path.rsplit(':').next().unwrap_or(path).trim();
-                    continue;
-                }
-                if !l.starts_with("[FAIL") {
-                    continue;
-                }
-                // `[FAIL: reason] name(args) (gas: n)` or `... (runs: n, ...)`; the reason (a fuzz
-                // counterexample, say) can contain `]`, so the name is read from the right.
-                let head = l
-                    .rsplit_once(" (gas:")
-                    .or_else(|| l.rsplit_once(" (runs:"))
-                    .map_or(l, |(h, _)| h);
-                let call = head.rsplit_once("] ").map_or(head, |(_, c)| c);
-                let name = call.split('(').next().unwrap_or(call).trim();
-                let full = format!("{contract}::{name}");
-                if !failed.contains(&full) {
+/// Reads `forge test --json`: one JSON object, `{"<file>:<Contract>": {"test_results":
+/// {"<name>(<args>)": {"status": ...}}}}`. Structured output, so a line a test prints cannot pass
+/// for a suite header, and two contracts of one name in different files stay apart. A skipped test
+/// stops the run: it measured nothing. A failed `setUp` is the failure `<file>::<Contract>::setUp`
+/// (the suite's tests did not run), so a row has to name it to count it.
+fn forge_failures(out: &str) -> Result<Vec<String>, String> {
+    let line = out
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('{'))
+        .ok_or_else(|| format!("no `forge test --json` output (is --json in `test`?):\n{out}"))?;
+    let v: serde_json::Value = serde_json::from_str(line)
+        .map_err(|e| format!("`forge test --json` output did not parse: {e}\n{out}"))?;
+    let suites = v
+        .as_object()
+        .ok_or("`forge test --json` output is not an object")?;
+    let mut failed = vec![];
+    let mut ran = 0;
+    for (suite, body) in suites {
+        let (file, contract) = suite
+            .rsplit_once(':')
+            .ok_or_else(|| format!("unexpected suite name `{suite}`"))?;
+        let results = body["test_results"]
+            .as_object()
+            .ok_or_else(|| format!("suite `{suite}` has no test_results"))?;
+        for (test, r) in results {
+            let name = test.split('(').next().unwrap_or(test);
+            let full = format!("{file}::{contract}::{name}");
+            match r["status"].as_str() {
+                Some("Success") => ran += 1,
+                Some("Failure") => {
+                    ran += 1;
                     failed.push(full);
                 }
+                Some("Skipped") => {
+                    return Err(format!(
+                        "`{full}` was skipped: a skipped test measures nothing"
+                    ))
+                }
+                other => return Err(format!("`{full}` has status {other:?}")),
             }
         }
     }
-    failed
+    if ran == 0 {
+        return Err(format!("`forge test --json` ran no test:\n{out}"));
+    }
+    Ok(failed)
 }
 
 fn default_fuzz_alive() -> String {
@@ -1207,27 +1212,53 @@ mod tests {
     }
 
     #[test]
-    fn forge_failures_are_named_by_contract_once() {
-        let out = "Ran 3 tests for test/Hip3Source.t.sol:Hip3SourceTest
-Suite result: ok. 3 passed; 0 failed; 0 skipped; finished in 11.34ms (1.97ms CPU time)
-Ran 14 tests for test/FiveMin.t.sol:FiveMinTest
-[FAIL: next call did not revert as expected] test_betsRefused_atStart_andTooEarly() (gas: 110489)
-[FAIL: assertion failed; counterexample: calldata=0x12 args=[1, 2]] testFuzz_payouts(uint96,bool) (runs: 3, μ: 1, ~: 1)
-Suite result: FAILED. 12 passed; 2 failed; 0 skipped; finished in 62.21ms (58.63ms CPU time)
-Encountered 2 failing tests in test/FiveMin.t.sol:FiveMinTest
-[FAIL: next call did not revert as expected] test_betsRefused_atStart_andTooEarly() (gas: 110489)
-[FAIL: assertion failed; counterexample: calldata=0x12 args=[1, 2]] testFuzz_payouts(uint96,bool) (runs: 3, μ: 1, ~: 1)
-Encountered a total of 2 failing tests, 15 tests succeeded";
-        assert!(tests_ran(TestFormat::Forge, out));
-        assert!(!tests_ran(TestFormat::Cargo, out));
+    fn forge_json_failures_are_named_by_file_and_contract() {
+        let out = r#"Compiling 3 files
+{"test/a/Dual.t.sol:DualTest":{"test_results":{"testGuard()":{"status":"Failure"},"testOk()":{"status":"Success"}}},"test/b/Dual.t.sol:DualTest":{"test_results":{"testGuard()":{"status":"Failure"},"testFuzz_x(uint96,bool)":{"status":"Success"}}}}"#;
+        let failed = failed_tests(TestFormat::Forge, out).unwrap();
         assert_eq!(
-            failed_tests(TestFormat::Forge, out),
+            failed,
             vec![
-                "FiveMinTest::test_betsRefused_atStart_andTooEarly",
-                "FiveMinTest::testFuzz_payouts"
+                "test/a/Dual.t.sol::DualTest::testGuard",
+                "test/b/Dual.t.sol::DualTest::testGuard"
             ]
         );
-        assert!(!tests_ran(TestFormat::Forge, "Error: Compiler run failed:"));
+        // a row names a test by its full name, or by the bare test name when that is unambiguous:
+        // `testGuard` names two failures here, which compare refuses
+        assert!(test_is(&failed[0], "testGuard") && test_is(&failed[1], "testGuard"));
+        assert!(test_is(
+            &failed[0],
+            "test/a/Dual.t.sol::DualTest::testGuard"
+        ));
+        assert!(!test_is(
+            &failed[1],
+            "test/a/Dual.t.sol::DualTest::testGuard"
+        ));
+    }
+
+    #[test]
+    fn forge_json_refuses_runs_that_measured_nothing() {
+        let skipped = r#"{"test/V.t.sol:VTest":{"test_results":{"testW()":{"status":"Skipped"}}}}"#;
+        assert!(failed_tests(TestFormat::Forge, skipped)
+            .unwrap_err()
+            .contains("skipped"));
+        assert!(
+            failed_tests(TestFormat::Forge, "Error: Compiler run failed")
+                .unwrap_err()
+                .contains("--json")
+        );
+        assert!(failed_tests(TestFormat::Forge, "{}")
+            .unwrap_err()
+            .contains("ran no test"));
+        // a failed setUp is named, not read as the suite's tests passing
+        let setup = r#"{"test/V.t.sol:VTest":{"test_results":{"setUp()":{"status":"Failure"}}}}"#;
+        assert_eq!(
+            failed_tests(TestFormat::Forge, setup).unwrap(),
+            vec!["test/V.t.sol::VTest::setUp"]
+        );
+        // text that only looks like forge output is not a run
+        let text = "Ran 2 tests for test/Real.t.sol:RealTest\n[FAIL: x] testOne() (gas: 1)\nSuite result: FAILED.";
+        assert!(failed_tests(TestFormat::Forge, text).is_err());
     }
 
     #[test]

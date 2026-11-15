@@ -23,7 +23,7 @@ We say plainly what the AI wrote. The point is not to hide it. It is to check it
 ## Use it
 
 ```bash
-cargo install --git https://github.com/fabrknt/unproven --tag v0.1.0
+cargo install --git https://github.com/fabrknt/unproven --tag v0.2.0
 unproven path/to/unproven.toml                  # every row, after a baseline run
 unproven path/to/unproven.toml --only "Close:"  # some rows, while you write them
 ```
@@ -35,10 +35,12 @@ The file holds the commands (`build`, `test`, optionally `fuzz`, `probe` and `pr
 `[[claim]]` per check. [`examples/unproven.toml`](examples/unproven.toml) is a real one, with 17
 rows. What it reads, today:
 
-- tests, by `test_format`: `cargo` (the default, `test <path> ... FAILED`) or `forge`
-  (Foundry's `[FAIL: ...] <name>(...)` lines, each named `<Contract>::<name>`, and listed once
-  though forge repeats them in its summary). A test command that fails with no failing test is a
-  build error, and stops the run.
+- tests, by `test_format`: `cargo` (the default, `test <path> ... FAILED`) or `forge`, which
+  reads the JSON of `forge test --json` (put `--json` in `test`). Forge tests are named
+  `<file>::<Contract>::<name>`; a row names one by that, or by `<name>` alone when only one test
+  has it. A skipped test stops the run (it measured nothing), and a failed `setUp` is the failure
+  `<file>::<Contract>::setUp`. A test command that fails with no failing test is a build error,
+  and stops the run.
 - fuzz: [Crucible](https://github.com/asymmetric-research/crucible)'s (`[FUZZ_FINDING] [...]`). The
   fuzzer is meant to run until stopped. Unless it has already printed the finding the row
   expects, one that exits before `fuzz_seconds`, or never prints `fuzz_alive` (default
@@ -83,7 +85,7 @@ own work. Give a Claude Code agent the skill:
 
 ```bash
 mkdir -p .claude/skills/unproven
-curl -fsSL https://raw.githubusercontent.com/fabrknt/unproven/v0.1.0/skills/unproven/SKILL.md \
+curl -fsSL https://raw.githubusercontent.com/fabrknt/unproven/v0.2.0/skills/unproven/SKILL.md \
     -o .claude/skills/unproven/SKILL.md
 ```
 
